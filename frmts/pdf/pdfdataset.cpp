@@ -6333,16 +6333,21 @@ int PDFDataset::ParseVP(GDALPDFObject* poVP, double dfMediaBoxWidth, double dfMe
             dfLargestArea = dfArea;
         }
     }
-    if (iRequestedVP > -1) {
-        iLargest = iRequestedVP;
-    }
 
     if (nLength > 1)
     {
         CPLDebug("PDF", "Largest BBox in VP array is element %d", iLargest);
     }
 
-    GDALPDFObject* poVPElt = poVPArray->Get(iLargest);
+    GDALPDFObject* poVPElt = nullptr;
+
+    if (iRequestedVP > -1) {
+        CPLDebug("PDF", "Requested NEATLINE BBox in VP array is element %d", iRequestedVP);
+        poVPElt = poVPArray->Get(iRequestedVP);
+    } else {
+        poVPElt = poVPArray->Get(iLargest);
+    }
+
     if (poVPElt == nullptr || poVPElt->GetType() != PDFObjectType_Dictionary)
     {
         return FALSE;
