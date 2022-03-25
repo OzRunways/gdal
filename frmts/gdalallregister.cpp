@@ -547,10 +547,6 @@ void CPL_STDCALL GDALAllRegister()
     GDALRegister_PRF();
 #endif
 
-#ifdef FRMT_rda
-    GDALRegister_RDA();
-#endif
-
 #ifdef FRMT_eeda
     GDALRegister_EEDAI();
     GDALRegister_EEDA();
@@ -626,7 +622,7 @@ void CPL_STDCALL GDALAllRegister()
 /*      Register GDAL HTTP last, to let a chance to other drivers       */
 /*      accepting URL to handle them before.                            */
 /* -------------------------------------------------------------------- */
-#ifdef FRMT_wcs
+#if (!defined(GDAL_CMAKE_BUILD) && defined(FRMT_wcs)) || (defined(GDAL_CMAKE_BUILD) && defined(FRMT_http))
     GDALRegister_HTTP();
 #endif
 

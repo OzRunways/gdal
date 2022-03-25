@@ -559,27 +559,16 @@ GDALWarpAppOptions* GDALWarpAppOptionsClone(const GDALWarpAppOptions *psOptionsI
 
 #ifdef USE_PROJ_BASED_VERTICAL_SHIFT_METHOD
 
-/************************************************************************/
-/*                      ApplyVerticalShift()                            */
-/************************************************************************/
-
-static bool ApplyVerticalShift( GDALDatasetH hWrkSrcDS,
-                                const GDALWarpAppOptions* psOptions,
-                                GDALWarpOptions *psWO )
+static bool MustApplyVerticalShift( GDALDatasetH hWrkSrcDS,
+                                    const GDALWarpAppOptions* psOptions,
+                                    OGRSpatialReference& oSRSSrc,
+                                    OGRSpatialReference& oSRSDst,
+                                    bool& bSrcHasVertAxis,
+                                    bool& bDstHasVertAxis )
 {
-    bool bApplyVShift = false;
-
-    if( psOptions->bVShift )
-    {
-        bApplyVShift = true;
-        psWO->papszWarpOptions = CSLSetNameValue(psWO->papszWarpOptions,
-                                                 "APPLY_VERTICAL_SHIFT",
-                                                 "YES");
-    }
+    bool bApplyVShift = psOptions->bVShift;
 
     // Check if we must do vertical shift grid transform
-    OGRSpatialReference oSRSSrc;
-    OGRSpatialReference oSRSDst;
     const char* pszSrcWKT = CSLFetchNameValue(psOptions->papszTO, "SRC_SRS");
     if( pszSrcWKT )
         oSRSSrc.SetFromUserInput( pszSrcWKT );
@@ -594,13 +583,45 @@ static bool ApplyVerticalShift( GDALDatasetH hWrkSrcDS,
     if( pszDstWKT )
         oSRSDst.SetFromUserInput( pszDstWKT );
 
-    const bool bSrcHasVertAxis =
+    bSrcHasVertAxis =
         oSRSSrc.IsCompound() ||
         ((oSRSSrc.IsProjected() || oSRSSrc.IsGeographic()) && oSRSSrc.GetAxesCount() == 3);
 
-    const bool bDstHasVertAxis =
+    bDstHasVertAxis =
         oSRSDst.IsCompound() ||
         ((oSRSDst.IsProjected() || oSRSDst.IsGeographic()) && oSRSDst.GetAxesCount() == 3);
+
+    if( (GDALGetRasterCount(hWrkSrcDS) == 1 || psOptions->bVShift) &&
+        (bSrcHasVertAxis || bDstHasVertAxis) )
+    {
+        bApplyVShift = true;
+    }
+    return bApplyVShift;
+}
+
+/************************************************************************/
+/*                      ApplyVerticalShift()                            */
+/************************************************************************/
+
+static bool ApplyVerticalShift( GDALDatasetH hWrkSrcDS,
+                                const GDALWarpAppOptions* psOptions,
+                                GDALWarpOptions *psWO )
+{
+    if( psOptions->bVShift )
+    {
+        psWO->papszWarpOptions = CSLSetNameValue(psWO->papszWarpOptions,
+                                                 "APPLY_VERTICAL_SHIFT",
+                                                 "YES");
+    }
+
+    OGRSpatialReference oSRSSrc;
+    OGRSpatialReference oSRSDst;
+    bool bSrcHasVertAxis = false;
+    bool bDstHasVertAxis = false;
+    bool bApplyVShift = MustApplyVerticalShift( hWrkSrcDS, psOptions,
+                                                oSRSSrc, oSRSDst,
+                                                bSrcHasVertAxis,
+                                                bDstHasVertAxis );
 
     if( (GDALGetRasterCount(hWrkSrcDS) == 1 || psOptions->bVShift) &&
         (bSrcHasVertAxis || bDstHasVertAxis) )
@@ -1277,6 +1298,29 @@ GDALDatasetH GDALWarp( const char *pszDest, GDALDatasetH hDstDS,
 }
 
 /************************************************************************/
+/*                    UseTEAndTSAndTRConsistently()                     */
+/************************************************************************/
+
+static bool UseTEAndTSAndTRConsistently(const GDALWarpAppOptions *psOptions)
+{
+    // We normally don't allow -te, -ts and -tr together, unless they are all
+    // consistent. The interest of this is to use the -tr values to produce
+    // exact pixel size, rather than inferring it from -te and -ts
+
+    // Constant and logic to be kept in sync with cogdriver.cpp
+    constexpr double RELATIVE_ERROR_RES_SHARED_BY_COG_AND_GDALWARP = 1e-8;
+    return psOptions->nForcePixels != 0 &&
+            psOptions->nForceLines != 0 &&
+            psOptions->dfXRes != 0 &&
+            psOptions->dfYRes != 0 &&
+            !(psOptions->dfMinX == 0.0 && psOptions->dfMinY == 0.0 && psOptions->dfMaxX == 0.0 && psOptions->dfMaxY == 0.0) &&
+            fabs((psOptions->dfMaxX - psOptions->dfMinX) / psOptions->dfXRes - psOptions->nForcePixels) <=
+                 RELATIVE_ERROR_RES_SHARED_BY_COG_AND_GDALWARP &&
+            fabs((psOptions->dfMaxY - psOptions->dfMinY) / psOptions->dfYRes - psOptions->nForceLines) <=
+                 RELATIVE_ERROR_RES_SHARED_BY_COG_AND_GDALWARP;
+}
+
+/************************************************************************/
 /*                            CheckOptions()                            */
 /************************************************************************/
 
@@ -1326,7 +1370,8 @@ static bool CheckOptions(const char *pszDest,
 /* -------------------------------------------------------------------- */
 
     if ((psOptions->nForcePixels != 0 || psOptions->nForceLines != 0) &&
-        (psOptions->dfXRes != 0 && psOptions->dfYRes != 0))
+        (psOptions->dfXRes != 0 && psOptions->dfYRes != 0) &&
+        !UseTEAndTSAndTRConsistently(psOptions) )
     {
         CPLError(CE_Failure, CPLE_IllegalArg, "-tr and -ts options cannot be used at the same time.");
         if(pbUsageError)
@@ -2204,6 +2249,22 @@ GDALDatasetH GDALWarpDirect( const char *pszDest, GDALDatasetH hDstDS,
         psOptions->papszTO = CSLSetNameValue(psOptions->papszTO,
                                              "STRIP_VERT_CS", "YES");
     }
+    else if( nSrcCount > 0 )
+    {
+        bool bSrcHasVertAxis = false;
+        bool bDstHasVertAxis = false;
+        OGRSpatialReference oSRSSrc;
+        OGRSpatialReference oSRSDst;
+        bool bApplyVShift = MustApplyVerticalShift( pahSrcDS[0], psOptions,
+                                                    oSRSSrc, oSRSDst,
+                                                    bSrcHasVertAxis,
+                                                    bDstHasVertAxis );
+        if( bApplyVShift )
+        {
+            psOptions->papszTO = CSLSetNameValue(psOptions->papszTO,
+                                                 "PROMOTE_TO_3D", "YES");
+        }
+    }
 #else
     psOptions->papszTO = CSLSetNameValue(psOptions->papszTO,
                                          "STRIP_VERT_CS", "YES");
@@ -2691,7 +2752,7 @@ GDALDatasetH GDALWarpDirect( const char *pszDest, GDALDatasetH hDstDS,
 #ifdef USE_PROJ_BASED_VERTICAL_SHIFT_METHOD
         if( !psOptions->bNoVShift )
         {
-            // Can modify both psWO->papszWarpOptions
+            // Can modify psWO->papszWarpOptions
             if( ApplyVerticalShift( hWrkSrcDS, psOptions, psWO ) )
             {
                 bUseApproxTransformer = false;
@@ -3346,6 +3407,18 @@ GDALWarpCreateOutput( int nSrcCount, GDALDatasetH *pahSrcDS, const char *pszFile
                 double MinY = adfExtent[1];
                 int bSuccess = TRUE;
 
+                // +/-180 deg in longitude do not roundtrip sometimes
+                if( MinX == -180 )
+                    MinX += 1e-6;
+                if( MaxX == 180 )
+                    MaxX -= 1e-6;
+
+                // +/-90 deg in latitude do not roundtrip sometimes
+                if( MinY == -90 )
+                    MinY += 1e-6;
+                if( MaxY == 90 )
+                    MaxY -= 1e-6;
+
                 /* Check that the edges of the target image are in the validity area */
                 /* of the target projection */
                 const int N_STEPS = 20;
@@ -3476,7 +3549,17 @@ GDALWarpCreateOutput( int nSrcCount, GDALDatasetH *pahSrcDS, const char *pszFile
 /* -------------------------------------------------------------------- */
 /*      Did the user override some parameters?                          */
 /* -------------------------------------------------------------------- */
-    if( psOptions->dfXRes != 0.0 && psOptions->dfYRes != 0.0 )
+    if( UseTEAndTSAndTRConsistently(psOptions) )
+    {
+        adfDstGeoTransform[0] = psOptions->dfMinX;
+        adfDstGeoTransform[3] = psOptions->dfMaxY;
+        adfDstGeoTransform[1] = psOptions->dfXRes;
+        adfDstGeoTransform[5] = -psOptions->dfYRes;
+
+        nPixels = psOptions->nForcePixels;
+        nLines = psOptions->nForceLines;
+    }
+    else if( psOptions->dfXRes != 0.0 && psOptions->dfYRes != 0.0 )
     {
         if( psOptions->dfMinX == 0.0 && psOptions->dfMinY == 0.0 && psOptions->dfMaxX == 0.0 && psOptions->dfMaxY == 0.0 )
         {
